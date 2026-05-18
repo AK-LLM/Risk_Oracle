@@ -106,37 +106,41 @@ def render_forecast_tab(secrets: Dict[str, str]):
     st.subheader("Run a new forecast")
 
     # Session-state pattern: the text area owns its state via a key.
-    # The example selectbox writes into that state via on_change.
-    # This prevents user typing from being overridden on script reruns.
+    # Examples below populate it via button on_click callbacks (no typeable
+    # dropdown that could be confused with the text area).
     if "trigger_text" not in st.session_state:
         st.session_state.trigger_text = ""
 
-    def _apply_example():
-        selected = st.session_state.get("example_select", "—")
-        if selected != "—":
-            st.session_state.trigger_text = selected
+    # PRIMARY INPUT — the text area is the only place to type.
+    trigger = st.text_area(
+        "Trigger question — be specific and date-bound",
+        height=80,
+        placeholder="e.g., 'Will the S&P 500 close more than 20% below its current level at any point in 2026?'",
+        key="trigger_text",
+        help="Vague questions can't be scored. Include a specific event and a specific date.",
+    )
 
-    st.selectbox(
-        "Example trigger (or type your own below)",
-        options=[
-            "—",
+    # Example shortcuts — buttons only, can't be typed into.
+    def _set_example(ex: str):
+        st.session_state.trigger_text = ex
+
+    with st.expander("📋 Or click to use a preset example", expanded=False):
+        examples = [
             "Will direct Iran-Israel strikes still be occurring on October 1, 2026?",
             "Will the US enter a recession (two consecutive negative GDP quarters) by Q4 2026?",
             "Will a major H5N1 outbreak (>1000 human cases in one country) be declared by WHO before end of 2026?",
             "Will a Cat 4+ hurricane make US landfall during the 2026 Atlantic season?",
             "Will the S&P 500 close more than 20% below its current level at any point in 2026?",
-        ],
-        index=0,
-        key="example_select",
-        on_change=_apply_example,
-    )
-
-    trigger = st.text_area(
-        "Trigger (precise, dated question)",
-        height=80,
-        placeholder="Will <specific event> have occurred by <specific date>?",
-        key="trigger_text",
-    )
+            "Will the Bank of Canada raise its overnight policy rate at its next scheduled meeting?",
+        ]
+        for i, ex in enumerate(examples):
+            st.button(
+                ex,
+                key=f"ex_btn_{i}",
+                on_click=_set_example,
+                args=(ex,),
+                use_container_width=True,
+            )
 
     col1, col2 = st.columns([1, 1])
     with col1:
