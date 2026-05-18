@@ -140,7 +140,7 @@ def render_forecast_tab(secrets: Dict[str, str]):
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        run_button = st.button("Run forecast", type="primary", disabled=not trigger.strip())
+        run_button = st.button("Run forecast", type="primary")
     with col2:
         expected_resolution = st.date_input(
             "Expected resolution date (for calibration tracking)",
@@ -148,6 +148,15 @@ def render_forecast_tab(secrets: Dict[str, str]):
         )
 
     if not run_button:
+        st.caption(
+            "Tip: after typing your own question, click anywhere outside the text "
+            "box (or press Ctrl+Enter) before hitting Run — Streamlit commits text "
+            "areas on blur, not on every keystroke."
+        )
+        return
+
+    if not trigger.strip():
+        st.warning("Please enter a trigger question first.")
         return
 
     # === Step 1: Route ===
