@@ -105,8 +105,18 @@ def main():
 def render_forecast_tab(secrets: Dict[str, str]):
     st.subheader("Run a new forecast")
 
-    # Default examples
-    example = st.selectbox(
+    # Session-state pattern: the text area owns its state via a key.
+    # The example selectbox writes into that state via on_change.
+    # This prevents user typing from being overridden on script reruns.
+    if "trigger_text" not in st.session_state:
+        st.session_state.trigger_text = ""
+
+    def _apply_example():
+        selected = st.session_state.get("example_select", "—")
+        if selected != "—":
+            st.session_state.trigger_text = selected
+
+    st.selectbox(
         "Example trigger (or type your own below)",
         options=[
             "—",
@@ -117,13 +127,15 @@ def render_forecast_tab(secrets: Dict[str, str]):
             "Will the S&P 500 close more than 20% below its current level at any point in 2026?",
         ],
         index=0,
+        key="example_select",
+        on_change=_apply_example,
     )
-    default_trigger = "" if example == "—" else example
+
     trigger = st.text_area(
         "Trigger (precise, dated question)",
-        value=default_trigger,
         height=80,
         placeholder="Will <specific event> have occurred by <specific date>?",
+        key="trigger_text",
     )
 
     col1, col2 = st.columns([1, 1])
