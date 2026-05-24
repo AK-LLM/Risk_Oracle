@@ -1,25 +1,25 @@
 """
-Risk Oracle — Streamlit entrypoint.
-
-Run locally:  streamlit run app.py
-Run on Streamlit Community Cloud:  push to GitHub, connect via share.streamlit.io
+Risk Oracle — Streamlit entrypoint (v2 with portfolio, evidence assistant,
+explanation layer, watchlist, comparison view).
 """
 from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Dict
+from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from risk_oracle import router as router_mod
 from risk_oracle import models as models_mod
-from risk_oracle import reconcile as reconcile_mod
-from risk_oracle import osint as osint_mod
+from risk_oracle import router as router_mod
+from risk_oracle import pipeline as pipe_mod
 from risk_oracle import calibration as cal_mod
 from risk_oracle import decision as decision_mod
-from risk_oracle import contagion as contagion_mod
+from risk_oracle import portfolio as pf_mod
+from risk_oracle import watchlist as wl_mod
+from risk_oracle import evidence_assistant as evi_mod
+from risk_oracle import explanation as exp_mod
 from risk_oracle import visualization as viz
 from risk_oracle.taxonomy import TAXONOMY, get_category, CATEGORY_KEYS
 
@@ -33,7 +33,6 @@ st.set_page_config(
 
 
 def _get_secrets() -> Dict[str, str]:
-    """Read secrets from Streamlit secrets if available, else from env."""
     secrets: Dict[str, str] = {}
     for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "FRED_API_KEY",
                 "ACLED_API_KEY", "ACLED_EMAIL", "EXTERNAL_DB_URL"):
@@ -47,8 +46,6 @@ def _get_secrets() -> Dict[str, str]:
     return secrets
 
 
-# ---------- Sidebar ----------
-
 def render_sidebar(secrets: Dict[str, str]):
     st.sidebar.title("Risk Oracle")
     st.sidebar.caption("Probabilistic risk modeling with calibration feedback")
@@ -58,10 +55,16 @@ def render_sidebar(secrets: Dict[str, str]):
         ("Smart router (LLM)",
          "✓ active" if (secrets["ANTHROPIC_API_KEY"] or secrets["OPENAI_API_KEY"])
          else "○ rule-based fallback"),
+        ("Evidence assistant",
+         "✓ active" if (secrets["ANTHROPIC_API_KEY"] or secrets["OPENAI_API_KEY"])
+         else "○ needs LLM key"),
+        ("Explanation layer",
+         "✓ active" if (secrets["ANTHROPIC_API_KEY"] or secrets["OPENAI_API_KEY"])
+         else "○ template fallback"),
         ("FRED macro data", "✓ active" if secrets["FRED_API_KEY"] else "○ skipped"),
         ("ACLED conflict data", "✓ active" if secrets["ACLED_API_KEY"] else "○ skipped"),
         ("GDELT news", "✓ active (free)"),
-        ("Polymarket / Manifold", "✓ active (free)"),
+        ("Polymarket / Manifold / Metaculus", "✓ active (free)"),
         ("World Bank / USGS / NOAA", "✓ active (free)"),
     ]
     for label, status in rows:
@@ -69,49 +72,90 @@ def render_sidebar(secrets: Dict[str, str]):
 
     st.sidebar.divider()
     st.sidebar.markdown(
-        "**No API keys configured?** The system still works using only free sources. "
-        "Add keys via `.streamlit/secrets.toml` (local) or Cloud secrets (Community) for more signals."
+        "**No API keys?** Core forecasting still works using only free sources. "
+        "Add `ANTHROPIC_API_KEY` for smart routing, evidence elicitation, and explanations."
     )
 
 
-# ---------- Main app ----------
+# =============================================================================
+# Session state helpers
+# =============================================================================
+
+def _init_session_state():
+    if "trigger_text" not in st.session_state:
+        st.session_state.trigger_text = ""
+    if "situation_text" not in st.session_state:
+        st.session_state.situation_text = ""
+    if "evidence_factors" not in st.session_state:
+        st.session_state.evidence_factors = []
+    if "extracted_evidence" not in st.session_state:
+        st.session_state.extracted_evidence = None
+    if "last_forecast" not in st.session_state:
+        st.session_state.last_forecast = None
+
+
+def _set_example(text: str):
+    st.session_state.trigger_text = text
+
+
+def _set_evidence_from_extraction(extracted: list):
+    st.session_state.evidence_factors = [
+        {
+            "name": e.name,
+            "likelihood_ratio": e.likelihood_ratio,
+            "confidence": e.confidence,
+        }
+        for e in extracted
+    ]
+    st.session_state.extracted_evidence = extracted
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
+    _init_session_state()
     secrets = _get_secrets()
     render_sidebar(secrets)
 
     st.title("Risk Oracle")
     st.markdown(
         "Smart router → primary + critic models → reconciliation → OSINT verification → "
-        "calibrated probability with decision support."
+        "calibrated probability with explanation, portfolio context, and external comparison."
     )
 
-    tab_forecast, tab_history, tab_calibration, tab_about = st.tabs(
-        ["New forecast", "History", "Calibration", "About / architecture"]
-    )
+    tabs = st.tabs([
+        "🎯 New forecast",
+        "👁 Watchlist",
+        "💼 Portfolio",
+        "📋 History",
+        "📊 Calibration",
+        "ℹ About",
+    ])
 
-    with tab_forecast:
+    with tabs[0]:
         render_forecast_tab(secrets)
-    with tab_history:
+    with tabs[1]:
+        render_watchlist_tab(secrets)
+    with tabs[2]:
+        render_portfolio_tab()
+    with tabs[3]:
         render_history_tab()
-    with tab_calibration:
+    with tabs[4]:
         render_calibration_tab()
-    with tab_about:
+    with tabs[5]:
         render_about_tab()
 
 
-# ---------- Forecast tab ----------
+# =============================================================================
+# Forecast tab
+# =============================================================================
 
 def render_forecast_tab(secrets: Dict[str, str]):
     st.subheader("Run a new forecast")
 
-    # Session-state pattern: the text area owns its state via a key.
-    # Examples below populate it via button on_click callbacks (no typeable
-    # dropdown that could be confused with the text area).
-    if "trigger_text" not in st.session_state:
-        st.session_state.trigger_text = ""
-
-    # PRIMARY INPUT — the text area is the only place to type.
+    # ----- Trigger input -----
     trigger = st.text_area(
         "Trigger question — be specific and date-bound",
         height=80,
@@ -119,10 +163,6 @@ def render_forecast_tab(secrets: Dict[str, str]):
         key="trigger_text",
         help="Vague questions can't be scored. Include a specific event and a specific date.",
     )
-
-    # Example shortcuts — buttons only, can't be typed into.
-    def _set_example(ex: str):
-        st.session_state.trigger_text = ex
 
     with st.expander("📋 Or click to use a preset example", expanded=False):
         examples = [
@@ -134,359 +174,561 @@ def render_forecast_tab(secrets: Dict[str, str]):
             "Will the Bank of Canada raise its overnight policy rate at its next scheduled meeting?",
         ]
         for i, ex in enumerate(examples):
-            st.button(
-                ex,
-                key=f"ex_btn_{i}",
-                on_click=_set_example,
-                args=(ex,),
-                use_container_width=True,
-            )
+            st.button(ex, key=f"ex_btn_{i}", on_click=_set_example, args=(ex,),
+                      use_container_width=True)
 
-    col1, col2 = st.columns([1, 1])
+    # ----- Routing preview -----
+    if trigger.strip():
+        with st.expander("Router preview (classification before you run)", expanded=False):
+            decision = router_mod.route(trigger, secrets=secrets)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Primary category", get_category(decision.primary_category).name)
+            col2.metric("Router confidence", f"{decision.confidence:.0%}")
+            col3.metric("Mode", "LLM" if decision.used_llm else "Rule-based")
+            if decision.is_anomaly:
+                st.warning("Black-swan / anomaly flag: " + "; ".join(decision.anomaly_reasons))
+            if decision.secondary_categories:
+                st.info("Cross-category spillover candidates: " +
+                        ", ".join(get_category(c).name for c in decision.secondary_categories))
+            st.caption(decision.reasoning)
+    else:
+        decision = None
+
+    # ----- Evidence assistant (LLM) -----
+    st.markdown("### Evidence")
+    has_llm = bool(secrets["ANTHROPIC_API_KEY"] or secrets["OPENAI_API_KEY"])
+
+    if has_llm:
+        st.markdown(
+            "**Option A — describe the situation in plain English, let the assistant extract evidence factors.**"
+        )
+        situation = st.text_area(
+            "What do you know about the current situation?",
+            height=100,
+            placeholder="e.g., 'The Fed has signaled it's done hiking but Powell's tone last week was hawkish. Unemployment ticked up to 4.2% from 4.0%. Housing starts collapsed. Yield curve still inverted but flattening.'",
+            key="situation_text",
+        )
+        if st.button("🪄 Extract evidence factors", disabled=not (situation.strip() and trigger.strip())):
+            if decision is None:
+                decision = router_mod.route(trigger, secrets=secrets)
+            with st.spinner("Asking the assistant…"):
+                extracted = evi_mod.extract_evidence(
+                    trigger=trigger,
+                    situation=situation,
+                    category=decision.primary_category,
+                    secrets=secrets,
+                )
+            if extracted:
+                _set_evidence_from_extraction(extracted)
+                st.success(f"Extracted {len(extracted)} evidence factors. Review and edit below.")
+                st.rerun()
+            else:
+                st.error("Couldn't extract evidence. Try a more detailed description, or fill in evidence manually below.")
+    else:
+        st.info("Set `ANTHROPIC_API_KEY` to enable the assistant. Manual entry below.")
+
+    st.markdown("**Prior probability and evidence factors** — adjust as needed.")
+    if decision is None and trigger.strip():
+        decision = router_mod.route(trigger, secrets=secrets)
+    if decision is not None:
+        spec = decision.primary_spec
+        prior_default = float(spec.base_rate_default)
+        ref_note = spec.reference_class_note
+    else:
+        prior_default = 0.5
+        ref_note = "Run a trigger to anchor the prior to a reference class."
+
+    prior = st.slider(
+        "Prior probability (base rate before specific evidence)",
+        min_value=0.01, max_value=0.99, step=0.01, value=prior_default,
+    )
+    st.caption(f"Reference class: {ref_note}")
+
+    # ----- Render evidence editor -----
+    evidence_factors = st.session_state.evidence_factors or [
+        {"name": "Active signal supporting event", "likelihood_ratio": 2.0, "confidence": 0.7},
+        {"name": "Counter-signal toward resolution", "likelihood_ratio": 0.6, "confidence": 0.7},
+        {"name": "Structural/institutional incentive", "likelihood_ratio": 1.5, "confidence": 0.7},
+    ]
+    new_factors = []
+    n = st.number_input("Number of evidence factors", min_value=0, max_value=10,
+                        value=len(evidence_factors))
+    # Extend with empty defaults if user increased count
+    while len(evidence_factors) < n:
+        evidence_factors.append(
+            {"name": "New factor", "likelihood_ratio": 1.0, "confidence": 0.7}
+        )
+    for i in range(int(n)):
+        ev = evidence_factors[i]
+        cols = st.columns([3, 2, 1])
+        name = cols[0].text_input(f"Factor {i+1}", value=ev.get("name", ""), key=f"ev_n_{i}")
+        lr = cols[1].number_input(
+            "Likelihood ratio", min_value=0.05, max_value=20.0, step=0.1,
+            value=float(ev.get("likelihood_ratio", 1.0)), key=f"ev_lr_{i}",
+        )
+        conf = cols[2].slider(
+            "Conf.", min_value=0.0, max_value=1.0, step=0.05,
+            value=float(ev.get("confidence", 0.7)), key=f"ev_c_{i}",
+        )
+        # Show rationale if from extraction
+        if (st.session_state.extracted_evidence
+                and i < len(st.session_state.extracted_evidence)
+                and name == st.session_state.extracted_evidence[i].name):
+            st.caption("💡 " + st.session_state.extracted_evidence[i].rationale)
+        new_factors.append({"name": name, "likelihood_ratio": lr, "confidence": conf})
+    st.session_state.evidence_factors = new_factors
+
+    # ----- Run button -----
+    st.divider()
+    col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
-        run_button = st.button("Run forecast", type="primary")
+        run_button = st.button("Run forecast", type="primary",
+                               disabled=not trigger.strip(),
+                               use_container_width=True)
     with col2:
         expected_resolution = st.date_input(
-            "Expected resolution date (for calibration tracking)",
+            "Expected resolution date",
             value=datetime.utcnow().date() + timedelta(days=180),
         )
+    with col3:
+        save_to_watchlist = st.checkbox("Save to watchlist after running", value=False)
 
     if not run_button:
-        st.caption(
-            "Tip: after typing your own question, click anywhere outside the text "
-            "box (or press Ctrl+Enter) before hitting Run — Streamlit commits text "
-            "areas on blur, not on every keystroke."
-        )
         return
 
-    if not trigger.strip():
-        st.warning("Please enter a trigger question first.")
-        return
-
-    # === Step 1: Route ===
-    with st.spinner("Routing trigger through smart router…"):
+    # ----- Run the pipeline -----
+    if decision is None:
         decision = router_mod.route(trigger, secrets=secrets)
 
-    st.divider()
-    st.markdown("### Step 1 — Smart router")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Primary category", get_category(decision.primary_category).name)
-    with col2:
-        st.metric("Router confidence", f"{decision.confidence:.0%}")
-    with col3:
-        st.metric("Mode", "LLM" if decision.used_llm else "Rule-based")
+    ev_objects = [
+        models_mod.EvidenceFactor(
+            name=f["name"], likelihood_ratio=f["likelihood_ratio"],
+            confidence=f["confidence"],
+        ) for f in new_factors
+    ]
 
-    if decision.is_anomaly:
-        st.warning(
-            "**Black-swan / anomaly flag triggered.** This trigger doesn't fit cleanly into "
-            "any taxonomy category. Routing to the closest match but maximum uncertainty "
-            "should be assumed. Reasons: " + "; ".join(decision.anomaly_reasons)
-        )
-
-    if decision.secondary_categories:
-        st.info(
-            "Cross-category spillover detected. Secondary categories: "
-            + ", ".join(get_category(c).name for c in decision.secondary_categories)
-        )
-
-    if decision.extracted_features and decision.used_llm:
-        with st.expander("Extracted features"):
-            st.json(decision.extracted_features)
-
-    st.caption("Router reasoning: " + decision.reasoning)
-
-    spec = decision.primary_spec
-    st.caption(
-        f"**Primary model**: `{spec.primary_model}`  ·  "
-        f"**Critic model**: `{spec.critic_model}`"
-    )
-
-    # === Step 2: Build evidence ===
-    st.divider()
-    st.markdown("### Step 2 — Set prior and evidence")
-
-    with st.expander("Prior probability and evidence factors", expanded=True):
-        prior = st.slider(
-            "Base rate / prior probability (your starting belief before specific evidence)",
-            min_value=0.01, max_value=0.99, step=0.01,
-            value=float(spec.base_rate_default),
-        )
-        st.caption("Reference class: " + spec.reference_class_note)
-
-        st.markdown("**Evidence factors** — likelihood ratios for each piece of evidence.")
-        st.caption("LR > 1 raises probability; LR < 1 lowers it. 1.0 = neutral.")
-
-        ev_count = st.number_input("Number of evidence factors", min_value=0, max_value=8, value=3)
-        evidence: list[models_mod.EvidenceFactor] = []
-        defaults = [
-            ("Active signal supporting event", 2.0),
-            ("Counter-signal indicating resolution", 0.6),
-            ("Domestic/institutional incentive structure", 1.5),
-            ("Economic / capacity constraints", 0.8),
-        ]
-        for i in range(int(ev_count)):
-            cols = st.columns([3, 2, 1])
-            name = cols[0].text_input(
-                f"Factor {i+1} name", value=defaults[i % 4][0], key=f"ev_name_{i}"
-            )
-            lr = cols[1].number_input(
-                "Likelihood ratio",
-                min_value=0.05, max_value=20.0, step=0.1,
-                value=float(defaults[i % 4][1]), key=f"ev_lr_{i}",
-            )
-            conf = cols[2].slider(
-                "Conf.", min_value=0.0, max_value=1.0, step=0.05, value=0.8,
-                key=f"ev_conf_{i}",
-            )
-            evidence.append(models_mod.EvidenceFactor(name=name, likelihood_ratio=lr, confidence=conf))
-
-    # === Step 3: Run models ===
-    with st.spinner("Running primary + critic models…"):
-        impacts = models_mod.get_default_impacts(decision.primary_category)
-        primary = models_mod.run_primary(
-            decision.primary_category, prior, evidence, impacts,
-            duration_mean=spec.typical_duration_months,
-        )
-        critic = models_mod.run_critic(
-            decision.primary_category, prior, evidence, impacts,
-            duration_mean=spec.typical_duration_months,
-        )
-
-    # === Step 4: Reconcile ===
-    w_primary, w_critic = cal_mod.get_model_weights(decision.primary_category)
-    reconciled = reconcile_mod.reconcile(
-        primary, critic,
-        primary_calibration=w_primary, critic_calibration=w_critic,
-    )
-
-    st.divider()
-    st.markdown("### Step 3 — Parallel models + reconciliation")
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Primary P", f"{primary.posterior_probability:.1%}",
-                help=primary.methodology)
-    col2.metric("Critic P", f"{critic.posterior_probability:.1%}",
-                help=critic.methodology)
-    col3.metric("Disagreement", f"{reconciled.disagreement:.1%}",
-                delta="material" if reconciled.disagreement_flag else "small",
-                delta_color="inverse")
-
-    # === Step 5: OSINT verification ===
-    with st.spinner("Querying OSINT signals for verification…"):
-        osint_bundle = osint_mod.gather_osint(
-            query=trigger,
-            signal_keys=spec.osint_signals,
+    with st.spinner("Running primary + critic models, OSINT verification, and market comparison…"):
+        fr = pipe_mod.run_forecast(
+            trigger=trigger,
+            category=decision.primary_category,
+            prior=prior,
+            evidence=ev_objects,
             secrets=secrets,
         )
+    st.session_state.last_forecast = fr
 
-    market_prob = None
-    for sig in osint_bundle.signals:
-        if sig.source in ("polymarket", "manifold", "metaculus") and isinstance(sig.value, float):
-            market_prob = sig.value
-            break
-
-    # === Step 6: Final output ===
-    st.divider()
-    st.markdown("### Step 4 — Output: probability, band, and decision")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Probability", f"{reconciled.point_probability:.1%}")
-    col2.metric("Band low (P10-ish)", f"{reconciled.band_low:.1%}")
-    col3.metric("Band high (P90-ish)", f"{reconciled.band_high:.1%}")
-    if market_prob is not None:
-        col4.metric("Prediction market", f"{market_prob:.1%}",
-                    delta=f"{(market_prob - reconciled.point_probability):+.1%}",
-                    help="Live aggregated probability from prediction markets.")
-    else:
-        col4.metric("Prediction market", "—", help="No matching market found.")
-
-    st.plotly_chart(
-        viz.probability_band(
-            reconciled.point_probability,
-            reconciled.band_low,
-            reconciled.band_high,
-            primary.posterior_probability,
-            critic.posterior_probability,
-            market_p=market_prob,
-        ),
-        use_container_width=True,
-    )
-
-    for note in reconciled.notes:
-        st.info(note)
-
-    # Tail risk
-    tail = reconcile_mod.tail_risk(reconciled.combined_impact_samples)
-    st.markdown("#### Tail-explicit risk")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Expected loss", f"${tail['expected_loss']:,.0f}")
-    col2.metric("VaR 95%", f"${tail['VaR_95']:,.0f}")
-    col3.metric("VaR 99%", f"${tail['VaR_99']:,.0f}")
-    col4.metric("Worst 1% mean", f"${tail['worst_1pct_mean']:,.0f}")
-
-    st.plotly_chart(
-        viz.loss_distribution(
-            reconciled.combined_impact_samples,
-            title="Loss distribution (combined primary + critic, weighted)",
-        ),
-        use_container_width=True,
-    )
-
-    # Time dynamics
-    st.markdown("#### Time dynamics (hazard surface)")
-    times, p_active = reconcile_mod.time_hazard_surface(
-        reconciled.point_probability,
-        duration_mean_months=spec.typical_duration_months,
-        horizon_months=36,
-    )
-    st.plotly_chart(
-        viz.hazard_curve(times, p_active),
-        use_container_width=True,
-    )
-
-    # Cross-category contagion
-    st.markdown("#### Cross-category contagion")
-    spillover = contagion_mod.cross_category_spillover(
-        decision.primary_category,
-        tail["expected_loss"],
-        reconciled.point_probability,
-    )
-    if spillover:
-        st.plotly_chart(
-            viz.contagion_chart(spillover, tail["expected_loss"]),
-            use_container_width=True,
-        )
-
-    # OSINT verification
-    st.markdown("#### OSINT verification signals")
-    if not osint_bundle.signals:
-        st.caption("No OSINT signals returned for this trigger.")
-    else:
-        st.caption(
-            f"Queried {len(osint_bundle.sources_queried)} sources, "
-            f"{len(osint_bundle.sources_succeeded)} returned data."
-        )
-        for sig in osint_bundle.signals:
-            if sig.error:
-                st.text(f"○ {sig.source} ({sig.label}): error — {sig.error}")
-            elif sig.value is None:
-                st.text(f"○ {sig.source} ({sig.label}): no data")
-            else:
-                st.text(f"✓ {sig.source} ({sig.label}): {sig.interpretation}")
-
-    # Decision recommendation
-    st.markdown("#### Decision recommendation (Kelly-based)")
-    rec = decision_mod.kelly_recommendation(
-        reconciled.point_probability, reconciled.band_low, reconciled.band_high,
-    )
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Full Kelly fraction", f"{rec.kelly_fraction:+.1%}")
-    col2.metric("Fractional Kelly (¼)", f"{rec.fractional_kelly:+.1%}")
-    col3.metric("Action label", rec.confidence_label)
-    for note in rec.notes:
-        st.caption("• " + note)
-
-    sens = decision_mod.sensitivity_table(reconciled.point_probability)
-    st.markdown("**Sensitivity:**")
-    sens_df = pd.DataFrame(sens).T
-    sens_df["probability"] = sens_df["probability"].apply(lambda v: f"{v:.0%}")
-    sens_df["kelly_full"] = sens_df["kelly_full"].apply(lambda v: f"{v:+.1%}")
-    sens_df["kelly_quarter"] = sens_df["kelly_quarter"].apply(lambda v: f"{v:+.1%}")
-    sens_df["expected_value"] = sens_df["expected_value"].apply(lambda v: f"{v:+.2f}")
-    st.dataframe(sens_df, use_container_width=True)
-
-    # === Step 7: Log ===
+    # Persist as a logged prediction
     pred_id = cal_mod.log_prediction(
         cal_mod.Prediction(
             trigger=trigger,
             category=decision.primary_category,
-            primary_p=primary.posterior_probability,
-            critic_p=critic.posterior_probability,
-            reconciled_p=reconciled.point_probability,
-            band_low=reconciled.band_low,
-            band_high=reconciled.band_high,
+            primary_p=fr.primary_p,
+            critic_p=fr.critic_p,
+            reconciled_p=fr.point_p,
+            band_low=fr.band_low,
+            band_high=fr.band_high,
             expected_resolution=str(expected_resolution),
-            metadata={
-                "router_confidence": decision.confidence,
-                "router_used_llm": decision.used_llm,
-                "secondary_categories": decision.secondary_categories,
-                "is_anomaly": decision.is_anomaly,
-                "tail_risk": tail,
-                "primary_weight": reconciled.primary_weight,
-                "critic_weight": reconciled.critic_weight,
-                "market_prob": market_prob,
-            },
+            metadata={"market_prob": fr.market_prob, "tail": fr.tail_metrics},
         ),
     )
-    st.success(f"✓ Forecast logged (id={pred_id}). Resolve it on the History tab when the date arrives.")
+
+    if save_to_watchlist:
+        wl_id = wl_mod.add_item(wl_mod.WatchlistItem(
+            trigger=trigger,
+            category=decision.primary_category,
+            prior=prior,
+            evidence=new_factors,
+            alert_threshold=0.05,
+        ))
+        wl_mod.record_refresh(wl_id, fr.point_p, fr.band_low, fr.band_high, fr.market_prob)
+        st.info(f"Added to watchlist (id={wl_id}). Refresh from the Watchlist tab.")
+
+    _render_forecast_result(fr, decision, secrets, pred_id)
 
 
-# ---------- History tab ----------
+def _render_forecast_result(fr: pipe_mod.ForecastResult, decision, secrets: Dict[str, str],
+                            pred_id: int):
+    spec = get_category(fr.category)
+
+    st.divider()
+    st.markdown("### Output")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Reconciled P", f"{fr.point_p:.1%}")
+    col2.metric("Band low", f"{fr.band_low:.1%}")
+    col3.metric("Band high", f"{fr.band_high:.1%}")
+    if fr.market_prob is not None:
+        col4.metric("Markets avg", f"{fr.market_prob:.1%}",
+                    delta=f"{(fr.point_p - fr.market_prob):+.1%}")
+    else:
+        col4.metric("Markets avg", "—")
+
+    st.plotly_chart(
+        viz.probability_band(
+            fr.point_p, fr.band_low, fr.band_high,
+            fr.primary_p, fr.critic_p, market_p=fr.market_prob,
+        ),
+        use_container_width=True,
+    )
+
+    for note in fr.notes:
+        st.info(note)
+
+    # ----- Explanation -----
+    st.markdown("### Explanation")
+    with st.spinner("Generating explanation…"):
+        explanation = exp_mod.explain(
+            pipe_mod.forecast_to_explanation_state(fr),
+            secrets=secrets,
+        )
+    st.markdown(explanation)
+
+    # ----- Comparison view -----
+    st.markdown("### Comparison against external markets")
+    if fr.comparison and fr.comparison.items:
+        rows = []
+        for it in fr.comparison.items:
+            rows.append({
+                "Source": it.source,
+                "Probability": f"{it.probability:.1%}" if it.probability is not None else "—",
+                "Δ vs us": f"{(it.probability - fr.point_p):+.1%}" if it.probability is not None else "—",
+                "Matched questions": (it.question_matched[:120] + "…")
+                                     if len(it.question_matched) > 120
+                                     else it.question_matched or "—",
+                "Note": it.note,
+            })
+        rows.insert(0, {
+            "Source": "Our reconciled",
+            "Probability": f"{fr.point_p:.1%}",
+            "Δ vs us": "—",
+            "Matched questions": "—",
+            "Note": f"primary {fr.primary_p:.1%}, critic {fr.critic_p:.1%}",
+        })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        md = fr.comparison.max_disagreement()
+        if md is not None and md > 0.15:
+            st.warning(
+                f"You disagree with the market consensus by {md:.1%}. "
+                f"That's a strong signal — either you see something they don't, "
+                f"or your evidence is mis-weighted. Worth a second pass."
+            )
+
+    # ----- Portfolio context -----
+    st.markdown("### Portfolio context")
+    exposure, contributing = pf_mod.exposure_by_category(fr.category)
+    positions = pf_mod.list_positions()
+    if not positions:
+        st.caption("No positions in your portfolio. Add some on the Portfolio tab to see "
+                   "category-specific exposure here.")
+    else:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Net exposure to category", f"${exposure:,.0f}")
+        # Drawdown estimates — derive from tail risk relative to a reference asset value of $1M
+        expected_dd = min(40, 100 * fr.tail_metrics["expected_loss"] / 1e9) if fr.tail_metrics["expected_loss"] else 5
+        tail_dd = min(60, 100 * fr.tail_metrics["VaR_99"] / 1e9) if fr.tail_metrics["VaR_99"] else 12
+        loss = pf_mod.estimate_loss_given_event(
+            exposure_usd=max(0, exposure),
+            expected_drawdown_pct=expected_dd,
+            p99_drawdown_pct=tail_dd,
+        )
+        col2.metric("Expected loss (typical)", f"${loss['expected_loss']:,.0f}")
+        col3.metric("Tail loss (99th pct)", f"${loss['tail_loss']:,.0f}")
+
+        if contributing:
+            with st.expander(f"Positions contributing to this category ({len(contributing)})"):
+                rows = []
+                for p in contributing:
+                    sens = p.category_sensitivities.get(fr.category, 0.0)
+                    rows.append({
+                        "Ticker": p.ticker,
+                        "Notional": f"${p.notional_usd:,.0f}",
+                        "Direction": p.direction,
+                        "Sensitivity": f"{sens:+.1%}",
+                        "Effective exposure": f"${p.signed_notional() * sens:,.0f}",
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.markdown("**Hedge ideas (directional only, not advice):**")
+        for h in pf_mod.hedge_ideas(fr.category):
+            st.markdown(f"- {h}")
+
+    # ----- Tail risk -----
+    st.markdown("### Tail-explicit risk (illustrative $ units)")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Expected loss", f"${fr.tail_metrics['expected_loss']:,.0f}")
+    col2.metric("VaR 95%", f"${fr.tail_metrics['VaR_95']:,.0f}")
+    col3.metric("VaR 99%", f"${fr.tail_metrics['VaR_99']:,.0f}")
+    col4.metric("Worst 1% mean", f"${fr.tail_metrics['worst_1pct_mean']:,.0f}")
+    st.plotly_chart(viz.loss_distribution(fr.impact_samples, "Loss distribution"),
+                    use_container_width=True)
+
+    # ----- Time dynamics -----
+    times, p_active = reconcile_time_curve(fr.point_p, spec.typical_duration_months)
+    st.markdown("### Time dynamics")
+    st.plotly_chart(viz.hazard_curve(times, p_active), use_container_width=True)
+
+    # ----- Cross-category contagion -----
+    if fr.contagion_spillover:
+        st.markdown("### Cross-category contagion")
+        st.plotly_chart(
+            viz.contagion_chart(fr.contagion_spillover, fr.tail_metrics["expected_loss"]),
+            use_container_width=True,
+        )
+
+    # ----- OSINT details -----
+    with st.expander("OSINT verification signals (details)"):
+        if not fr.osint_bundle.signals:
+            st.caption("No OSINT signals returned.")
+        else:
+            for s in fr.osint_bundle.signals:
+                if s.error:
+                    st.text(f"○ {s.source} ({s.label}): error — {s.error}")
+                elif s.value is None:
+                    st.text(f"○ {s.source} ({s.label}): no data")
+                else:
+                    st.text(f"✓ {s.source} ({s.label}): {s.interpretation}")
+
+    # ----- Decision recommendation -----
+    st.markdown("### Decision recommendation (Kelly, generic)")
+    rec = decision_mod.kelly_recommendation(fr.point_p, fr.band_low, fr.band_high)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Full Kelly", f"{rec.kelly_fraction:+.1%}")
+    col2.metric("Quarter Kelly", f"{rec.fractional_kelly:+.1%}")
+    col3.metric("Label", rec.confidence_label)
+    for note in rec.notes:
+        st.caption("• " + note)
+
+    st.success(f"✓ Forecast logged (id={pred_id}). Resolve it later on the History tab.")
+
+
+def reconcile_time_curve(point_p, duration_mean):
+    from risk_oracle import reconcile as r
+    return r.time_hazard_surface(point_p, duration_mean, horizon_months=36)
+
+
+# =============================================================================
+# Watchlist tab
+# =============================================================================
+
+def render_watchlist_tab(secrets: Dict[str, str]):
+    st.subheader("Watchlist")
+    st.caption(
+        "Ongoing triggers you want to track. Click Refresh to re-run the full pipeline "
+        "for an item; the system records movement and flags alerts when reconciled "
+        "probability moves more than your threshold."
+    )
+
+    items = wl_mod.list_items()
+    if not items:
+        st.info(
+            "No watchlist items yet. Run a forecast and check 'Save to watchlist after running' "
+            "to add one."
+        )
+        return
+
+    # Summary table
+    rows = []
+    for it in items:
+        movement = it.movement()
+        rows.append({
+            "id": it.id,
+            "Category": get_category(it.category).name if it.category in TAXONOMY else it.category,
+            "Trigger": it.trigger[:90],
+            "Last P": f"{it.last_probability:.1%}" if it.last_probability is not None else "—",
+            "Band": (f"[{it.last_band_low:.0%}, {it.last_band_high:.0%}]"
+                     if it.last_band_low is not None else "—"),
+            "Market": f"{it.last_market_prob:.1%}" if it.last_market_prob is not None else "—",
+            "Δ vs prev": f"{movement:+.1%}" if movement is not None else "—",
+            "Alert": "🔔" if it.has_alert() else "",
+            "Last refresh": (it.last_refreshed_at.split("T")[0]
+                             if it.last_refreshed_at else "never"),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        choice = st.selectbox(
+            "Pick a watchlist item",
+            options=[f"#{it.id} — {it.trigger[:70]}" for it in items],
+        )
+        chosen = items[[f"#{it.id} — {it.trigger[:70]}" for it in items].index(choice)]
+    with col2:
+        if st.button("🔄 Refresh selected", use_container_width=True):
+            _refresh_watchlist_item(chosen, secrets)
+            st.rerun()
+    with col3:
+        if st.button("🗑 Remove selected", use_container_width=True):
+            wl_mod.remove_item(chosen.id)
+            st.rerun()
+
+    if st.button("🔄 Refresh ALL watchlist items"):
+        progress = st.progress(0.0, text="Refreshing…")
+        for i, it in enumerate(items):
+            _refresh_watchlist_item(it, secrets)
+            progress.progress((i + 1) / len(items),
+                              text=f"Refreshed #{it.id} ({i+1}/{len(items)})")
+        st.success("All items refreshed.")
+        st.rerun()
+
+    # History chart for chosen item
+    hist = wl_mod.history(chosen.id)
+    if hist:
+        st.markdown(f"### History for watchlist item #{chosen.id}")
+        df = pd.DataFrame(hist)
+        df["refreshed_at"] = pd.to_datetime(df["refreshed_at"])
+        st.line_chart(df.set_index("refreshed_at")[["probability"]])
+        with st.expander("Raw history rows"):
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def _refresh_watchlist_item(it: wl_mod.WatchlistItem, secrets: Dict[str, str]):
+    ev = [models_mod.EvidenceFactor(
+        name=f["name"], likelihood_ratio=f["likelihood_ratio"], confidence=f["confidence"],
+    ) for f in it.evidence]
+    fr = pipe_mod.run_forecast(
+        trigger=it.trigger, category=it.category, prior=it.prior,
+        evidence=ev, secrets=secrets, n_sims=10_000,
+    )
+    wl_mod.record_refresh(it.id, fr.point_p, fr.band_low, fr.band_high, fr.market_prob)
+
+
+# =============================================================================
+# Portfolio tab
+# =============================================================================
+
+def render_portfolio_tab():
+    st.subheader("Portfolio")
+    st.caption(
+        "Tag each position with its sensitivity to each risk category (0 = unaffected, "
+        "1 = fully exposed, negative = hedged). Forecasts then show the dollar exposure "
+        "and estimated loss for your specific positions."
+    )
+
+    positions = pf_mod.list_positions()
+    if positions:
+        rows = []
+        for p in positions:
+            rows.append({
+                "id": p.id, "Ticker": p.ticker, "Description": p.description,
+                "Notional": f"${p.notional_usd:,.0f}", "Direction": p.direction,
+                **{f"sens.{k[:6]}": f"{p.category_sensitivities.get(k, 0):+.0%}"
+                   for k in CATEGORY_KEYS},
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            remove_id = st.number_input("Remove position by id", min_value=0, value=0, step=1)
+            if st.button("Remove") and remove_id > 0:
+                pf_mod.remove_position(int(remove_id))
+                st.rerun()
+    else:
+        st.info("No positions yet. Add one below.")
+
+    st.divider()
+    st.markdown("### Add a position")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        ticker = st.text_input("Ticker / symbol", placeholder="XOM")
+    with col2:
+        notional = st.number_input("Notional USD", min_value=0.0, step=1000.0, value=10000.0)
+    with col3:
+        direction = st.selectbox("Direction", ["long", "short"])
+    with col4:
+        asset_class = st.selectbox(
+            "Asset class hint (sets default sensitivities)",
+            ["custom", "equity_broad", "equity_tech", "equity_energy",
+             "equity_financial", "equity_health", "equity_consumer",
+             "bond_treasury", "bond_corporate",
+             "commodity_oil", "commodity_gold", "crypto", "fx_usd", "cash"],
+        )
+    description = st.text_input("Description (optional)", placeholder="Energy giant")
+
+    default_sens = pf_mod.suggest_sensitivities(asset_class)
+    st.markdown("**Category sensitivities** — how exposed is this position to each risk category?")
+    sens_cols = st.columns(4)
+    sensitivities: Dict[str, float] = {}
+    for i, key in enumerate(CATEGORY_KEYS):
+        with sens_cols[i % 4]:
+            sensitivities[key] = st.slider(
+                get_category(key).name,
+                min_value=-1.0, max_value=1.0, step=0.05,
+                value=float(default_sens.get(key, 0.0)),
+                key=f"sens_{key}",
+            )
+    if st.button("Add position", type="primary", disabled=not ticker.strip()):
+        pf_mod.add_position(pf_mod.Position(
+            ticker=ticker.strip().upper(), description=description,
+            notional_usd=notional, direction=direction,
+            category_sensitivities={k: v for k, v in sensitivities.items() if abs(v) > 1e-6},
+        ))
+        st.success(f"Added {ticker}.")
+        st.rerun()
+
+
+# =============================================================================
+# History tab
+# =============================================================================
 
 def render_history_tab():
     st.subheader("Prediction history")
     rows = cal_mod.list_predictions(limit=200)
     if not rows:
-        st.info("No predictions yet. Run a forecast on the New forecast tab.")
+        st.info("No predictions yet.")
         return
-
     df = pd.DataFrame(rows)
-    show_cols = ["id", "created_at", "category", "reconciled_p",
-                 "band_low", "band_high", "expected_resolution", "resolved",
-                 "resolution_outcome", "brier_reconciled", "trigger"]
-    df_show = df[show_cols].copy()
-    for col in ("reconciled_p", "band_low", "band_high"):
-        df_show[col] = df_show[col].apply(lambda v: f"{v:.0%}")
-    df_show["brier_reconciled"] = df_show["brier_reconciled"].apply(
+    show = ["id", "created_at", "category", "reconciled_p",
+            "band_low", "band_high", "expected_resolution", "resolved",
+            "resolution_outcome", "brier_reconciled", "trigger"]
+    d = df[show].copy()
+    for c in ("reconciled_p", "band_low", "band_high"):
+        d[c] = d[c].apply(lambda v: f"{v:.0%}")
+    d["brier_reconciled"] = d["brier_reconciled"].apply(
         lambda v: f"{v:.3f}" if v is not None else "—"
     )
-    st.dataframe(df_show, use_container_width=True, hide_index=True)
+    st.dataframe(d, use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Resolve a prediction")
     open_preds = [r for r in rows if r["resolved"] == 0]
     if not open_preds:
-        st.caption("No open predictions to resolve.")
+        st.caption("No open predictions.")
     else:
-        pred_choices = {f'#{r["id"]} ({r["category"]}) — {r["trigger"][:60]}': r["id"]
-                        for r in open_preds}
-        choice = st.selectbox("Pick a prediction to resolve", list(pred_choices.keys()))
-        outcome = st.radio("Did the event occur?", ["Yes", "No"], horizontal=True)
+        choices = {f'#{r["id"]} ({r["category"]}) — {r["trigger"][:60]}': r["id"]
+                   for r in open_preds}
+        c = st.selectbox("Pick a prediction", list(choices.keys()))
+        outcome = st.radio("Outcome?", ["Yes (event occurred)", "No (event did not occur)"],
+                           horizontal=True)
         if st.button("Mark resolved"):
-            cal_mod.resolve_prediction(pred_choices[choice], outcome == "Yes")
-            st.success("Resolved. Brier scores computed. Calibration weights updated.")
+            cal_mod.resolve_prediction(choices[c], outcome.startswith("Yes"))
+            st.success("Resolved. Brier scored. Calibration weights updated.")
             st.rerun()
 
     st.divider()
-    st.markdown("### Export")
     csv = df.to_csv(index=False)
-    st.download_button(
-        "Download all predictions as CSV",
-        csv.encode("utf-8"),
-        file_name="risk_oracle_predictions.csv",
-        mime="text/csv",
-    )
+    st.download_button("Download predictions as CSV", csv.encode("utf-8"),
+                       "risk_oracle_predictions.csv", mime="text/csv")
 
 
-# ---------- Calibration tab ----------
+# =============================================================================
+# Calibration tab
+# =============================================================================
 
 def render_calibration_tab():
     st.subheader("Calibration dashboard")
     st.caption(
-        "Brier score: (forecast - actual)² averaged across resolved predictions. "
-        "Lower is better. < 0.20 is decent, < 0.10 is excellent. "
-        "Random guessing scores 0.25."
+        "Brier score = (forecast - actual)² averaged across resolved predictions. "
+        "Lower is better. 0.25 = random; <0.20 = decent; <0.10 = excellent. "
+        "Calibration weights update automatically based on these scores."
     )
     stats = cal_mod.category_brier_stats()
     if not stats:
         st.info(
-            "No resolved predictions yet. Calibration emerges after ~50 resolved "
-            "predictions per category. Run forecasts, set expected resolution dates, "
-            "and come back to score them."
+            "No resolved predictions yet. Calibration weights stabilise after ~50 "
+            "resolutions per category. Run forecasts, resolve them on the History tab."
         )
         return
-
     rows = []
     for cat, s in stats.items():
         rows.append({
@@ -498,51 +740,47 @@ def render_calibration_tab():
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.markdown(
-        "**How weights update**: the reconciliation layer reads the rolling Brier "
-        "from the last 50 resolved predictions per category and uses `weight = 1 - Brier`. "
-        "Better-performing models get more weight automatically."
-    )
 
-
-# ---------- About tab ----------
+# =============================================================================
+# About tab
+# =============================================================================
 
 def render_about_tab():
-    st.subheader("Architecture")
+    st.subheader("Risk Oracle — Architecture")
     st.markdown("""
-This system implements the architecture designed across the planning conversation:
+**v1 core**: 8-category taxonomy · smart router (LLM + rule-based fallback) ·
+parallel primary + critic models · reconciliation with disagreement-as-uncertainty ·
+OSINT verification (GDELT, FRED, Polymarket, Manifold, Metaculus, USGS, World Bank, NOAA) ·
+SQLite calibration store with Brier-scored feedback loop · cross-category contagion ·
+time-hazard surface · tail-explicit output (VaR, ES) · black-swan detection ·
+Kelly-based decision recommendation.
 
-**v1 core**:
-- Smart router with LLM feature extraction + rule-based fallback
-- 8-category trigger taxonomy with primary + critic model assignments
-- Bayesian probability update + Monte Carlo impact simulation (20k sims)
-- Reconciliation with disagreement-as-uncertainty (band widens with model disagreement)
-- OSINT verification using free/open APIs (GDELT, FRED, Polymarket, Manifold, USGS, World Bank)
-- Calibration loop with Brier scoring and rolling model weight updates
+**v2 enhancements (this version)**:
+- 💼 **Portfolio context** — tag positions by category sensitivity; forecasts show
+  your specific dollar exposure and hedge ideas.
+- 🪄 **Evidence assistant** — describe the situation in plain English; an LLM
+  extracts evidence factors with suggested likelihood ratios and rationale.
+- 📝 **Explanation layer** — every forecast gets a 2-3 paragraph natural-language
+  explanation of why the probability landed where it did.
+- 👁 **Watchlist** — persistent ongoing triggers with manual refresh and
+  movement-based alerts. Background polling requires running locally + cron.
+- ⚖ **Comparison view** — side-by-side with Polymarket, Manifold, Metaculus.
+  Large disagreement with market consensus is flagged.
 
-**v2 enhancements (active)**:
-- Cross-category contagion (interaction matrix between categories)
-- Time dynamics (exponential hazard surface over 36 months)
-- Tail-explicit output (VaR 95%, VaR 99%, Expected Shortfall, worst 1%)
-- Black swan detection (anomaly flag at router stage)
-- Decision layer (Kelly criterion, fractional Kelly, sensitivity)
-
-**v3 hooks (extensible interfaces)**:
-- Prediction market integration (live for Polymarket and Manifold)
-- Active learning / VOI calculation (basic)
-- Causal DAGs, LLM wargaming, multilingual OSINT, satellite vision —
-  interfaces in place, implementations to layer in
-
-**Critical honest caveats**:
-- Underlying primary/critic models are simplified illustrative versions of
-  GARCH, SEIR, FAIR, catastrophe models, etc. The architecture is right;
-  the underlying models should be swapped for production-grade equivalents
-  for specific domains.
-- Calibration requires ~50 resolved predictions per category before weights
-  meaningfully diverge from 50/50.
-- This is decision support, not an oracle. Tracking your predictions is the
-  single highest-value habit you can build.
+**Honest caveats**:
+- Underlying primary/critic models are simplified illustrative variants. Swap in
+  real GARCH / SEIR / catastrophe / FAIR / Bayesian-network implementations for
+  production-grade accuracy in specific categories.
+- Calibration weights only diverge from 50/50 after ~50 resolved predictions
+  per category. Be patient.
+- Portfolio loss estimates assume an illustrative $1B "reference unit"; for
+  precise dollar conversions, override `expected_drawdown_pct` in
+  `portfolio.estimate_loss_given_event`.
+- Watchlist on Streamlit Community Cloud has no true background polling; click
+  "Refresh all" or run locally with cron. Calibration DB is ephemeral on
+  Community unless you wire `EXTERNAL_DB_URL` to a persistent Postgres.
+- This is decision support, not an oracle. Tracking and resolving predictions
+  is the single highest-leverage habit.
 """)
 
 

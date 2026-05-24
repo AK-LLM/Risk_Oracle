@@ -7,13 +7,18 @@ Architecture (designed across many conversations):
 1. **Smart router** — extracts features from the trigger, classifies it into one of 8 categories, and assigns primary + critic models from different methodological traditions.
 2. **Parallel ensemble** — primary model + adversarial critic run independently.
 3. **Reconciliation** — Bayesian model averaging weighted by historical calibration; disagreement widens the uncertainty band rather than averaging it away.
-4. **OSINT verification** — implied-observables check against multi-source open feeds (GDELT, FRED, Polymarket, prediction markets).
+4. **OSINT verification** — implied-observables check against multi-source open feeds (GDELT, FRED, Polymarket, Manifold, Metaculus, USGS, World Bank, NOAA).
 5. **Calibration loop** — every prediction logged with resolution date; Brier-scored on resolution; weights feed back to router and reconcile.
 6. **Decision layer** — Kelly-sized position recommendations, sensitivity analysis, value-of-information for next research step.
 
 v2 features included as live modules: cross-category contagion, time dynamics (hazard surface), tail-explicit output, black swan detection, decision layer.
 
-v3 hooks present: prediction market integration (live for Polymarket and Manifold), causal DAG structure (stub interface), active learning (VOI calculation).
+**v2 enhancements (new in this version)**:
+- 💼 **Portfolio context** — track positions tagged by category sensitivity; forecasts show your specific dollar exposure and hedge ideas.
+- 🪄 **Evidence assistant** — describe a situation in plain English, LLM extracts structured evidence factors with suggested likelihood ratios (requires `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`).
+- 📝 **Explanation layer** — every forecast gets a 2-3 paragraph natural-language explanation (LLM-powered when key present, template fallback otherwise).
+- 👁 **Watchlist** — persistent ongoing triggers with manual or scripted refresh, movement-based alerts.
+- ⚖ **Comparison view** — side-by-side with Polymarket, Manifold, Metaculus on every forecast.
 
 ## Setup — Local install
 
