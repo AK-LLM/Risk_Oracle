@@ -120,3 +120,135 @@ def value_of_information(
         "voi_score": float(voi),
         "band_reduction_pct_points": float(100 * reduction),
     }
+
+
+# ============================================================================
+# Polymarket-specific bet sizing
+# ============================================================================
+
+@dataclass
+class PolymarketRecommendation:
+    side: str                       # "YES", "NO", or "PASS"
+    market_yes_price: float
+    our_probability: float
+    edge: float                     # absolute edge in probability points
+    full_kelly_fraction: float       # fraction of bankroll (full Kelly)
+    fractional_kelly_fraction: float # fraction of bankroll (typically quarter)
+    expected_value_per_dollar: float # USD return per USD risked
+    recommended_size_usd: float      # in USD, after liquidity & sanity clamps
+    raw_kelly_size_usd: float        # before any clamps
+    liquidity_warning: bool
+    notes: List[str]
+
+
+def polymarket_recommendation(
+    our_probability: float,
+    band_low: float,
+    band_high: float,
+    market_yes_price: float,
+    bankroll_usd: float = 10_000,
+    available_liquidity_usd: float = 1_000,
+    fractional_factor: float = 0.25,   # quarter Kelly default
+    min_edge: float = 0.02,
+    max_position_pct_of_bankroll: float = 0.10,
+) -> PolymarketRecommendation:
+    """Recommend a Polymarket bet given our forecast vs. the live market price.
+
+    Polymarket binary market mechanics:
+      A YES share costs `market_yes_price` (0–1) and pays $1 if YES resolves.
+      A NO share costs `1 - market_yes_price` and pays $1 if NO resolves.
+      For YES at price p_m with true probability p_t:
+          EV per dollar = (p_t - p_m) / p_m
+          Kelly fraction = (p_t * b - (1 - p_t)) / b   where b = (1 - p_m) / p_m
+      Symmetric for NO (flip signs).
+
+    Returns a structured recommendation including liquidity-aware position size.
+    """
+    notes: List[str] = []
+    p_t = max(min(our_probability, 0.999), 0.001)
+    p_m = max(min(market_yes_price, 0.999), 0.001)
+
+    edge_yes = p_t - p_m
+    if abs(edge_yes) < min_edge:
+        return PolymarketRecommendation(
+            side="PASS",
+            market_yes_price=p_m, our_probability=p_t,
+            edge=abs(edge_yes),
+            full_kelly_fraction=0.0, fractional_kelly_fraction=0.0,
+            expected_value_per_dollar=0.0,
+            recommended_size_usd=0.0, raw_kelly_size_usd=0.0,
+            liquidity_warning=False,
+            notes=[
+                f"Edge ({edge_yes:+.1%}) is below the {min_edge:.0%} threshold — "
+                f"likely doesn't beat transaction costs and fees. Pass."
+            ],
+        )
+
+    if edge_yes > 0:
+        side = "YES"
+        b = (1 - p_m) / p_m
+        f_full = (p_t * b - (1 - p_t)) / b
+        ev_per_dollar = (p_t - p_m) / p_m
+    else:
+        side = "NO"
+        p_no = 1 - p_m
+        p_t_no = 1 - p_t
+        b = (1 - p_no) / p_no
+        f_full = (p_t_no * b - (1 - p_t_no)) / b
+        ev_per_dollar = (p_t_no - p_no) / p_no
+
+    f_full = max(0.0, f_full)
+    f_frac = f_full * fractional_factor
+    raw_size = f_frac * bankroll_usd
+
+    # Clamps: never more than X% of bankroll, never more than 20% of liquidity
+    cap_bankroll = max_position_pct_of_bankroll * bankroll_usd
+    cap_liquidity = 0.20 * available_liquidity_usd
+
+    final_size = raw_size
+    liquidity_warning = False
+
+    if final_size > cap_bankroll:
+        notes.append(
+            f"Raw Kelly size (${raw_size:.0f}) exceeds {max_position_pct_of_bankroll:.0%} "
+            f"of bankroll cap (${cap_bankroll:.0f}). Capping at bankroll limit."
+        )
+        final_size = cap_bankroll
+
+    if final_size > cap_liquidity:
+        liquidity_warning = True
+        notes.append(
+            f"Size (${final_size:.0f}) is >20% of available liquidity "
+            f"(${available_liquidity_usd:.0f}); slippage will be material. "
+            f"Capping at ${cap_liquidity:.0f}."
+        )
+        final_size = cap_liquidity
+
+    # Band sanity check
+    band_width = band_high - band_low
+    if abs(edge_yes) < 0.05 and band_width > 0.20:
+        notes.append(
+            f"Edge ({edge_yes:+.1%}) is small relative to confidence band "
+            f"({band_width:.0%} wide). Consider waiting for higher conviction."
+        )
+
+    if f_full > 0.5:
+        notes.append(
+            f"Full Kelly is {f_full:.1%} of bankroll — that's extremely large. "
+            f"Fractional Kelly strongly recommended; size shown is "
+            f"{fractional_factor:.0%} of full."
+        )
+
+    return PolymarketRecommendation(
+        side=side,
+        market_yes_price=p_m,
+        our_probability=p_t,
+        edge=abs(edge_yes),
+        full_kelly_fraction=float(f_full),
+        fractional_kelly_fraction=float(f_frac),
+        expected_value_per_dollar=float(ev_per_dollar),
+        recommended_size_usd=float(final_size),
+        raw_kelly_size_usd=float(raw_size),
+        liquidity_warning=liquidity_warning,
+        notes=notes,
+    )

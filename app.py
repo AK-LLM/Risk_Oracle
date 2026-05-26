@@ -20,6 +20,8 @@ from risk_oracle import portfolio as pf_mod
 from risk_oracle import watchlist as wl_mod
 from risk_oracle import evidence_assistant as evi_mod
 from risk_oracle import explanation as exp_mod
+from risk_oracle import polymarket as pm_mod
+from risk_oracle import bet_tracker as bet_mod
 from risk_oracle import visualization as viz
 from risk_oracle.taxonomy import TAXONOMY, get_category, CATEGORY_KEYS
 
@@ -127,6 +129,8 @@ def main():
 
     tabs = st.tabs([
         "🎯 New forecast",
+        "🟣 Polymarket",
+        "💰 Bets",
         "👁 Watchlist",
         "💼 Portfolio",
         "📋 History",
@@ -137,14 +141,18 @@ def main():
     with tabs[0]:
         render_forecast_tab(secrets)
     with tabs[1]:
-        render_watchlist_tab(secrets)
+        render_polymarket_tab(secrets)
     with tabs[2]:
-        render_portfolio_tab()
+        render_bets_tab(secrets)
     with tabs[3]:
-        render_history_tab()
+        render_watchlist_tab(secrets)
     with tabs[4]:
-        render_calibration_tab()
+        render_portfolio_tab()
     with tabs[5]:
+        render_history_tab()
+    with tabs[6]:
+        render_calibration_tab()
+    with tabs[7]:
         render_about_tab()
 
 
@@ -452,6 +460,84 @@ def _render_forecast_result(fr: pipe_mod.ForecastResult, decision, secrets: Dict
         for h in pf_mod.hedge_ideas(fr.category):
             st.markdown(f"- {h}")
 
+    # ----- Polymarket edge analysis -----
+    st.markdown("### 🟣 Polymarket edge analysis")
+    with st.spinner("Searching Polymarket for matching markets…"):
+        pm_matches = pm_mod.search_markets(fr.trigger, limit=5)
+
+    if not pm_matches:
+        st.caption(
+            "No matching Polymarket markets found. Try the Polymarket tab to browse "
+            "the most active markets and pick one as a trigger."
+        )
+    else:
+        st.caption(f"Found {len(pm_matches)} matching market(s). Edge analysis below.")
+        # Bankroll setting via session state
+        if "pm_bankroll" not in st.session_state:
+            st.session_state.pm_bankroll = 10_000.0
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            bankroll = st.number_input(
+                "Bankroll USD", min_value=100.0, step=500.0,
+                value=float(st.session_state.pm_bankroll),
+                key="pm_bankroll_input",
+            )
+            st.session_state.pm_bankroll = bankroll
+
+        for i, m in enumerate(pm_matches):
+            if m.yes_price is None:
+                continue
+            rec = decision_mod.polymarket_recommendation(
+                our_probability=fr.point_p,
+                band_low=fr.band_low,
+                band_high=fr.band_high,
+                market_yes_price=m.yes_price,
+                bankroll_usd=bankroll,
+                available_liquidity_usd=max(50.0, m.liquidity_usd),
+            )
+            with st.container(border=True):
+                st.markdown(f"**{m.question}**")
+                st.caption(
+                    f"vol 24h ${m.volume_24h_usd:,.0f} · liq ${m.liquidity_usd:,.0f}"
+                    + (f" · closes in {m.days_until_close}d" if m.days_until_close is not None else "")
+                    + f" · [open on polymarket.com →]({m.url})"
+                )
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Market YES", f"{m.yes_price:.1%}")
+                c2.metric("Our P", f"{fr.point_p:.1%}")
+                c3.metric("Edge", f"{rec.edge:.1%}",
+                          delta=rec.side if rec.side != "PASS" else None,
+                          delta_color="normal" if rec.side != "PASS" else "off")
+                c4.metric("EV per $1", f"${rec.expected_value_per_dollar:+.2f}")
+                c5.metric("Recommended size", f"${rec.recommended_size_usd:,.0f}")
+                if rec.side != "PASS":
+                    log_key = f"log_bet_{m.id}_{i}"
+                    if st.button(
+                        f"Log {rec.side} bet at ${rec.recommended_size_usd:,.0f}",
+                        key=log_key,
+                        type="secondary",
+                    ):
+                        bet_id = bet_mod.log_bet(bet_mod.Bet(
+                            placed_at=datetime.utcnow().isoformat(),
+                            market_id=m.id, market_question=m.question,
+                            market_url=m.url, side=rec.side,
+                            entry_price=m.yes_price if rec.side == "YES" else (1 - m.yes_price),
+                            size_usd=rec.recommended_size_usd,
+                            our_probability=fr.point_p,
+                            edge_at_entry=rec.edge,
+                            expected_value_usd=rec.recommended_size_usd * rec.expected_value_per_dollar,
+                            forecast_id=pred_id,
+                            notes="",
+                        ))
+                        st.success(f"Bet #{bet_id} logged. See Bets tab.")
+                for note in rec.notes:
+                    st.caption("• " + note)
+                if rec.liquidity_warning:
+                    st.warning(
+                        "Liquidity warning — slippage will be material. "
+                        "Stack the order or split across sessions."
+                    )
+
     # ----- Tail risk -----
     st.markdown("### Tail-explicit risk (illustrative $ units)")
     col1, col2, col3, col4 = st.columns(4)
@@ -591,6 +677,151 @@ def _refresh_watchlist_item(it: wl_mod.WatchlistItem, secrets: Dict[str, str]):
         evidence=ev, secrets=secrets, n_sims=10_000,
     )
     wl_mod.record_refresh(it.id, fr.point_p, fr.band_low, fr.band_high, fr.market_prob)
+
+
+# =============================================================================
+# Polymarket tab
+# =============================================================================
+
+def render_polymarket_tab(secrets: Dict[str, str]):
+    st.subheader("Polymarket — browse and use as triggers")
+    st.caption(
+        "Browse the most active prediction markets. Click 'Use as trigger' on "
+        "any market to pre-fill the New Forecast tab. The system will run its "
+        "model and compute your edge vs. the live market price."
+    )
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        sort_by = st.selectbox("Sort by", ["volume", "liquidity"], index=0)
+    with col2:
+        limit = st.slider("How many markets", min_value=5, max_value=50, value=20)
+
+    with st.spinner("Fetching live Polymarket markets…"):
+        markets = pm_mod.top_markets(limit=limit, sort_by=sort_by)
+
+    if not markets:
+        st.warning("Couldn't reach Polymarket Gamma API. Try again in a moment.")
+        return
+
+    st.caption(f"Showing top {len(markets)} live markets sorted by {sort_by}.")
+
+    for m in markets:
+        if m.yes_price is None:
+            continue
+        with st.container(border=True):
+            cols = st.columns([4, 1, 1, 1, 1])
+            with cols[0]:
+                st.markdown(f"**{m.question}**")
+                meta_bits = [
+                    f"YES ${m.yes_price:.2f}",
+                    f"vol24h ${m.volume_24h_usd:,.0f}",
+                    f"liq ${m.liquidity_usd:,.0f}",
+                ]
+                if m.days_until_close is not None:
+                    meta_bits.append(f"closes in {m.days_until_close}d")
+                if m.category:
+                    meta_bits.append(f"#{m.category}")
+                st.caption(" · ".join(meta_bits) + f"  ·  [polymarket.com →]({m.url})")
+            cols[1].metric("YES", f"{m.yes_price:.0%}")
+            cols[2].metric("Vol24h", f"${m.volume_24h_usd/1000:,.0f}k")
+            cols[3].metric("Liq", f"${m.liquidity_usd/1000:,.0f}k")
+            with cols[4]:
+                if st.button("Use as trigger", key=f"pm_use_{m.id}"):
+                    st.session_state.trigger_text = m.question
+                    st.success("Loaded into New Forecast tab.")
+
+
+# =============================================================================
+# Bets tab
+# =============================================================================
+
+def render_bets_tab(secrets: Dict[str, str]):
+    st.subheader("Bets ledger")
+    st.caption(
+        "All Polymarket bets you've logged from the forecast tab. Resolve them "
+        "when the market closes to track P&L, win rate, and edge realization."
+    )
+
+    s = bet_mod.summary()
+    if s["total_bets"] == 0:
+        st.info(
+            "No bets logged yet. Run a forecast on the New Forecast tab — when a "
+            "matching Polymarket market exists with positive edge, you'll get a "
+            "'Log bet' button that records it here."
+        )
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Open / Closed", f"{s['open_bets']} / {s['closed_bets']}")
+    c2.metric("Realized P&L", f"${s['realized_pnl_usd']:+,.0f}",
+              delta=f"{s['roi']*100:+.1f}% ROI" if s['roi'] is not None else None)
+    c3.metric("Win rate", f"{s['win_rate']:.0%}" if s['win_rate'] is not None else "—",
+              delta=f"vs expected {s['expected_win_rate']:.0%}"
+                    if s['expected_win_rate'] is not None else None)
+    if s["calibration_gap"] is not None:
+        gap = s["calibration_gap"]
+        c4.metric("Calibration gap", f"{gap:+.1%}",
+                  help="Actual win rate minus expected win rate. Positive = under-confident; "
+                       "negative = over-confident.")
+    else:
+        c4.metric("Calibration gap", "—")
+
+    st.divider()
+    st.markdown("### Open bets")
+    open_b = bet_mod.list_bets(only_open=True)
+    if not open_b:
+        st.caption("No open bets.")
+    else:
+        rows = []
+        for b in open_b:
+            rows.append({
+                "id": b["id"], "Market": b["market_question"][:80],
+                "Side": b["side"], "Entry": f"${b['entry_price']:.2f}",
+                "Size": f"${b['size_usd']:,.0f}",
+                "Our P": f"{b['our_probability']:.0%}",
+                "Edge at entry": f"{b['edge_at_entry']:.1%}",
+                "Placed": b["placed_at"][:10],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.markdown("**Resolve a bet**")
+        choices = {f'#{b["id"]} — {b["market_question"][:60]} ({b["side"]})': b["id"]
+                   for b in open_b}
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            choice = st.selectbox("Pick a bet", list(choices.keys()))
+        with c2:
+            outcome = st.radio("Outcome", ["YES", "NO"], horizontal=True)
+        with c3:
+            if st.button("Resolve"):
+                bet_mod.resolve_bet(choices[choice], outcome)
+                st.success("Resolved and P&L computed.")
+                st.rerun()
+
+    st.divider()
+    st.markdown("### Closed bets (recent)")
+    closed = [b for b in bet_mod.list_bets() if b["resolved"] == 1][:50]
+    if not closed:
+        st.caption("No closed bets yet.")
+    else:
+        rows = []
+        for b in closed:
+            won = b["side"] == b["outcome"]
+            rows.append({
+                "id": b["id"], "Market": b["market_question"][:80],
+                "Side / Outcome": f"{b['side']} → {b['outcome']}",
+                "Result": "✓ win" if won else "✗ loss",
+                "Size": f"${b['size_usd']:,.0f}",
+                "P&L": f"${b['pnl_usd']:+,.0f}" if b['pnl_usd'] is not None else "—",
+                "Edge at entry": f"{b['edge_at_entry']:.1%}",
+                "Closed": (b['closed_at'] or "")[:10],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    csv = pd.DataFrame(bet_mod.list_bets()).to_csv(index=False)
+    st.download_button("Download bet history as CSV", csv.encode("utf-8"),
+                       "risk_oracle_bets.csv", mime="text/csv")
 
 
 # =============================================================================
