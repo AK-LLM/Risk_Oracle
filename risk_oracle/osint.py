@@ -269,6 +269,111 @@ def fetch_manifold_search(query: str, max_markets: int = 5) -> Optional[OSINTSig
                            value=None, error=str(e))
 
 
+# ---------- V2.1: Fed Speech NLP (macro_financial enrichment) ----------
+
+_FED_HAWKISH = {
+    "inflation persistent", "above target", "additional tightening", "restrictive",
+    "higher for longer", "vigilance", "wage pressure", "tight labor market",
+    "overheating", "hike", "raise rates", "tighten",
+}
+_FED_DOVISH = {
+    "moderating", "easing", "rate cuts", "accommodation", "below target",
+    "softening labor", "disinflation", "weakening demand", "downside risks",
+    "recession risk", "supportive policy", "lower rates", "weakening economy",
+}
+
+
+def fetch_fed_speeches(query: str = "", lookback_days: int = 14) -> Optional[OSINTSignal]:
+    """Net hawkish/dovish tilt of recent Fed speeches.
+
+    Returns OSINTSignal with value in [-1, +1]:
+      -1 → strongly dovish (rate-cut bias; risk-on for risk assets)
+      +1 → strongly hawkish (rate-hold/hike bias; risk-off)
+      0  → balanced / no signal
+
+    The `query` arg is unused but kept for SIGNAL_FETCHERS dispatch parity.
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        r = requests.get(
+            "https://www.federalreserve.gov/feeds/speeches.xml",
+            headers={"User-Agent": "risk_oracle/2.1 contact:local@example.com"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        # Tally hawkish/dovish terms across recent items
+        hawkish = 0
+        dovish = 0
+        items_read = 0
+        for item in root.iter("item"):
+            text = " ".join([
+                (item.findtext("title") or ""),
+                (item.findtext("description") or ""),
+            ]).lower()
+            if not text.strip():
+                continue
+            items_read += 1
+            for t in _FED_HAWKISH:
+                if t in text:
+                    hawkish += 1
+            for t in _FED_DOVISH:
+                if t in text:
+                    dovish += 1
+        if items_read == 0:
+            return OSINTSignal(
+                source="fed_speeches", label="net_tilt",
+                value=0, interpretation="No recent Fed speeches found.",
+            )
+        total = hawkish + dovish
+        if total == 0:
+            tilt = 0.0
+            label = "balanced"
+        else:
+            tilt = (hawkish - dovish) / total  # range [-1, +1]
+            label = "hawkish" if tilt > 0.15 else ("dovish" if tilt < -0.15 else "balanced")
+        return OSINTSignal(
+            source="fed_speeches",
+            label="net_tilt",
+            value=float(tilt),
+            interpretation=(
+                f"{items_read} recent Fed speeches read; net tilt {label} "
+                f"({hawkish} hawkish vs {dovish} dovish term hits)."
+            ),
+            raw={"items_read": items_read, "hawkish_hits": hawkish, "dovish_hits": dovish},
+        )
+    except Exception as e:
+        return OSINTSignal(
+            source="fed_speeches", label="net_tilt", value=None, error=str(e),
+        )
+
+
+# ---------- V2.1: Politician trades (political_regulatory enrichment) ----------
+
+def fetch_politician_trades_volume(query: str = "", lookback_days: int = 14) -> Optional[OSINTSignal]:
+    """Volume of recent Senate/House periodic transaction reports as an
+    OSINT signal for political_regulatory category.
+
+    Currently a stub. The Senate (efdsearch.senate.gov) and House
+    (disclosures-clerk.house.gov) provide PDFs and search but no clean
+    public JSON. Aggregators like capitoltrades.com offer JSON APIs but
+    require keys. Returns None when no source is configured so the
+    OSINT bundle reports it as 'queried but unavailable'.
+
+    To wire a real source: set CAPITOLTRADES_API_KEY in secrets and
+    implement the GET against their /v1/trades endpoint.
+    """
+    return OSINTSignal(
+        source="politician_trades",
+        label="ptr_volume_14d",
+        value=None,
+        interpretation=(
+            "Politician trades source unconfigured. Set CAPITOLTRADES_API_KEY "
+            "or implement a senate/house PTR scraper to enable."
+        ),
+    )
+
+
 # ---------- Orchestrator ----------
 
 SIGNAL_FETCHERS = {
@@ -287,6 +392,9 @@ SIGNAL_FETCHERS = {
     "have_i_been_pwned": lambda q, _: None,
     "edgar": lambda q, _: None,
     "market_data": lambda q, _: None,
+    # V2.1 additions
+    "fed_speeches": lambda q, _: fetch_fed_speeches(q),
+    "politician_trades": lambda q, _: fetch_politician_trades_volume(q),
 }
 
 
