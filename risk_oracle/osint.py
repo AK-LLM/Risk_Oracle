@@ -26,6 +26,7 @@ class OSINTSignal:
     interpretation: str = ""
     raw: Any = None
     error: Optional[str] = None
+    noise_level: str = "medium"  # V2.2: "low" / "medium" / "high"
 
 
 @dataclass
@@ -52,6 +53,24 @@ class OSINTBundle:
             if (s.value > 0 and expected_direction > 0) or (s.value < 0 and expected_direction < 0):
                 hits += 1
         return hits / scored if scored else 0.5
+
+    def weighted_concordance(self, expected_direction: int) -> float:
+        """V2.2: Noise-aware concordance. Low-noise sources (regulatory,
+        on-chain, official macro) carry more weight than high-noise (social,
+        manipulable prediction markets in early stages)."""
+        weights = {"low": 1.0, "medium": 0.6, "high": 0.3}
+        if not self.signals:
+            return 0.5
+        weighted_hits = 0.0
+        weighted_total = 0.0
+        for s in self.signals:
+            if s.error or not isinstance(s.value, (int, float)):
+                continue
+            w = weights.get(s.noise_level, 0.6)
+            weighted_total += w
+            if (s.value > 0 and expected_direction > 0) or (s.value < 0 and expected_direction < 0):
+                weighted_hits += w
+        return weighted_hits / weighted_total if weighted_total > 0 else 0.5
 
 
 # ---------- GDELT (free, no auth) ----------
@@ -374,6 +393,108 @@ def fetch_politician_trades_volume(query: str = "", lookback_days: int = 14) -> 
     )
 
 
+# V2.2: on-chain whale flow as an OSINT signal. Mirrors STP's lewis_feeds
+# pattern but exposes only the net direction (BUY/SELL) and count so the
+# Bayesian update treats it as a single evidence factor.
+
+_WHALE_KNOWN_CEX_TAGS = {
+    "binance", "coinbase", "kraken", "okx", "bitfinex", "bybit", "gate.io",
+    "kucoin", "bitstamp", "huobi", "gemini", "ftx",
+}
+_WHALE_USD_THRESHOLD = 5_000_000
+
+
+def _classify_whale_flow(tx: Dict[str, Any]) -> Optional[str]:
+    """CEX→private = accumulation (BUY). private→CEX = distribution (SELL)."""
+    from_owner = ((tx.get("from") or {}).get("owner") or "").lower()
+    to_owner = ((tx.get("to") or {}).get("owner") or "").lower()
+    from_type = ((tx.get("from") or {}).get("owner_type") or "").lower()
+    to_type = ((tx.get("to") or {}).get("owner_type") or "").lower()
+
+    from_is_cex = from_type == "exchange" or any(t in from_owner for t in _WHALE_KNOWN_CEX_TAGS)
+    to_is_cex = to_type == "exchange" or any(t in to_owner for t in _WHALE_KNOWN_CEX_TAGS)
+    if from_is_cex and not to_is_cex:
+        return "BUY"
+    if to_is_cex and not from_is_cex:
+        return "SELL"
+    return None
+
+
+def fetch_whale_transfers(query: str = "",
+                          secrets: Optional[Dict[str, str]] = None,
+                          lookback_hours: int = 6) -> Optional[OSINTSignal]:
+    """Net direction of on-chain whale flow over the last N hours.
+
+    Returns a numeric value in [-1, +1]:
+      +1.0 = all classifiable transfers were CEX→private (accumulation)
+      -1.0 = all classifiable transfers were private→CEX (distribution)
+       0.0 = balanced or no classifiable flow
+
+    Uses Whale Alert API when WHALE_ALERT_API_KEY is set; degrades to a
+    null signal otherwise (no free public substitute exists with the same
+    quality). Wired into market_specific and cyber_tech categories.
+    """
+    secrets = secrets or {}
+    api_key = (secrets.get("WHALE_ALERT_API_KEY") or "").strip()
+    if not api_key:
+        return OSINTSignal(
+            source="whale_transfers",
+            label="whale_flow_unconfigured",
+            value=None,
+            interpretation=(
+                "Whale Alert source unconfigured. Set WHALE_ALERT_API_KEY to "
+                "enable on-chain whale-flow signals for market_specific and cyber_tech."
+            ),
+            noise_level="low",
+        )
+
+    try:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        start = int((_dt.now(_tz.utc) - _td(hours=lookback_hours)).timestamp())
+        r = requests.get(
+            "https://api.whale-alert.io/v1/transactions",
+            params={"api_key": api_key, "min_value": _WHALE_USD_THRESHOLD,
+                    "start": start, "limit": 100},
+            timeout=12,
+        )
+        r.raise_for_status()
+        txs = r.json().get("transactions", []) or []
+    except Exception as e:
+        return OSINTSignal(source="whale_transfers", label="whale_flow",
+                           value=None, error=str(e), noise_level="low")
+
+    buys = 0
+    sells = 0
+    for tx in txs:
+        flow = _classify_whale_flow(tx)
+        if flow == "BUY":
+            buys += 1
+        elif flow == "SELL":
+            sells += 1
+
+    total = buys + sells
+    if total == 0:
+        flow_score = 0.0
+        interp = f"{len(txs)} whale transfers seen in last {lookback_hours}h but none classifiable as CEX↔private."
+    else:
+        flow_score = (buys - sells) / total
+        direction = "accumulation" if flow_score > 0.1 else ("distribution" if flow_score < -0.1 else "balanced")
+        interp = (
+            f"{total} classifiable whale transfers in last {lookback_hours}h "
+            f"({buys} accumulation, {sells} distribution). Net flow score "
+            f"{flow_score:+.2f} → {direction}."
+        )
+
+    return OSINTSignal(
+        source="whale_transfers",
+        label="whale_flow_score",
+        value=flow_score,
+        interpretation=interp,
+        raw={"buys": buys, "sells": sells, "total_seen": len(txs)},
+        noise_level="low",  # on-chain data is unmanipulable
+    )
+
+
 # ---------- Orchestrator ----------
 
 SIGNAL_FETCHERS = {
@@ -395,6 +516,26 @@ SIGNAL_FETCHERS = {
     # V2.1 additions
     "fed_speeches": lambda q, _: fetch_fed_speeches(q),
     "politician_trades": lambda q, _: fetch_politician_trades_volume(q),
+    # V2.2 additions
+    "whale_transfers": lambda q, sec: fetch_whale_transfers(q, sec),
+}
+
+
+# V2.2: per-source noise classification. Low-noise = regulatory / official /
+# on-chain. Medium = aggregated news / data. High = social / early
+# prediction-market consensus.
+SOURCE_NOISE = {
+    # Low noise (authoritative / regulatory / official / on-chain)
+    "fred": "low", "world_bank": "low", "usgs": "low", "noaa": "low",
+    "edgar": "low", "fed_speeches": "low", "cisa_kev": "low",
+    "whale_transfers": "low",
+    # Medium noise (aggregated news, market data)
+    "gdelt": "medium", "acled": "medium", "market_data": "medium",
+    "healthmap": "medium", "promed": "medium", "have_i_been_pwned": "medium",
+    # High noise (prediction markets in early stages can be manipulated;
+    # politician trades is filtered insider info but inconsistent reporting)
+    "polymarket": "high", "metaculus": "medium", "manifold": "high",
+    "politician_trades": "medium",
 }
 
 
@@ -413,6 +554,9 @@ def gather_osint(query: str, signal_keys: List[str],
             sig = OSINTSignal(source=key, label=key, value=None, error=str(e))
         if sig is None:
             continue
+        # V2.2: tag noise level if the fetcher didn't already
+        if sig.noise_level == "medium":
+            sig.noise_level = SOURCE_NOISE.get(sig.source, "medium")
         bundle.signals.append(sig)
         if sig.error is None and sig.value is not None:
             bundle.sources_succeeded.append(key)

@@ -691,20 +691,47 @@ def render_polymarket_tab(secrets: Dict[str, str]):
         "model and compute your edge vs. the live market price."
     )
 
-    col1, col2 = st.columns([1, 1])
+    # V2.2: category filter so the tab isn't drowned out by whatever sport is in season
+    col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
         sort_by = st.selectbox("Sort by", ["volume", "liquidity"], index=0)
     with col2:
+        category_choice = st.selectbox(
+            "Category",
+            ["All (ex-Sports)", "Stocks", "Crypto", "Macro", "Politics", "Tech", "Sports", "Other", "All"],
+            index=0,
+            help="Polymarket's raw 24h-volume sort tends to be dominated by whatever "
+                 "sport is in season (FIFA / NFL / NBA). Pick a category to focus.",
+        )
+    with col3:
         limit = st.slider("How many markets", min_value=5, max_value=50, value=20)
 
+    # Translate the dropdown choice into top_markets() arguments
+    if category_choice == "All":
+        cat_filter = None
+        excl = None
+    elif category_choice == "All (ex-Sports)":
+        cat_filter = None
+        excl = ["Sports"]
+    else:
+        cat_filter = category_choice
+        excl = None
+
     with st.spinner("Fetching live Polymarket markets…"):
-        markets = pm_mod.top_markets(limit=limit, sort_by=sort_by)
+        markets = pm_mod.top_markets(
+            limit=limit, sort_by=sort_by,
+            category_filter=cat_filter, exclude_categories=excl,
+        )
 
     if not markets:
-        st.warning("Couldn't reach Polymarket Gamma API. Try again in a moment.")
+        st.warning(
+            "No markets matched. If you picked a narrow category, try 'All' or "
+            "broaden the filter. (Polymarket Gamma API may also be rate-limiting.)"
+        )
         return
 
-    st.caption(f"Showing top {len(markets)} live markets sorted by {sort_by}.")
+    cat_label = category_choice
+    st.caption(f"Showing {len(markets)} live markets · category: {cat_label} · sorted by {sort_by}.")
 
     for m in markets:
         if m.yes_price is None:
@@ -717,11 +744,10 @@ def render_polymarket_tab(secrets: Dict[str, str]):
                     f"YES ${m.yes_price:.2f}",
                     f"vol24h ${m.volume_24h_usd:,.0f}",
                     f"liq ${m.liquidity_usd:,.0f}",
+                    f"#{pm_mod.guess_category_label(m)}",
                 ]
                 if m.days_until_close is not None:
                     meta_bits.append(f"closes in {m.days_until_close}d")
-                if m.category:
-                    meta_bits.append(f"#{m.category}")
                 st.caption(" · ".join(meta_bits) + f"  ·  [polymarket.com →]({m.url})")
             cols[1].metric("YES", f"{m.yes_price:.0%}")
             cols[2].metric("Vol24h", f"${m.volume_24h_usd/1000:,.0f}k")

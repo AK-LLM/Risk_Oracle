@@ -68,6 +68,18 @@ def init_db(db_path: Optional[str] = None) -> str:
                 market_prob REAL
             )
         """)
+        # V2.2: lifecycle + velocity columns on the main row. Use ALTER TABLE
+        # with try/except so existing v2.1 databases migrate transparently.
+        for ddl in [
+            "ALTER TABLE watchlist ADD COLUMN stage TEXT",
+            "ALTER TABLE watchlist ADD COLUMN velocity_acceleration TEXT",
+            "ALTER TABLE watchlist ADD COLUMN velocity_recent_delta REAL",
+            "ALTER TABLE watchlist ADD COLUMN regime_at_refresh TEXT",
+        ]:
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # column already exists
     return db_path
 
 
@@ -152,6 +164,10 @@ def record_refresh(
     band_high: float,
     market_prob: Optional[float] = None,
     db_path: Optional[str] = None,
+    stage: Optional[str] = None,
+    velocity_acceleration: Optional[str] = None,
+    velocity_recent_delta: Optional[float] = None,
+    regime_at_refresh: Optional[str] = None,
 ):
     db_path = db_path or _default_db_path()
     init_db(db_path)
@@ -168,9 +184,15 @@ def record_refresh(
                 last_band_low = ?,
                 last_band_high = ?,
                 last_market_prob = ?,
-                last_refreshed_at = ?
+                last_refreshed_at = ?,
+                stage = COALESCE(?, stage),
+                velocity_acceleration = COALESCE(?, velocity_acceleration),
+                velocity_recent_delta = COALESCE(?, velocity_recent_delta),
+                regime_at_refresh = COALESCE(?, regime_at_refresh)
             WHERE id = ?
-        """, (prev, probability, band_low, band_high, market_prob, now, item_id))
+        """, (prev, probability, band_low, band_high, market_prob, now,
+              stage, velocity_acceleration, velocity_recent_delta, regime_at_refresh,
+              item_id))
         c.execute("""
             INSERT INTO watchlist_history
             (watchlist_id, refreshed_at, probability, band_low, band_high, market_prob)

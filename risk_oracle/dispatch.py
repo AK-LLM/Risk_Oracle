@@ -121,6 +121,19 @@ def _build_body(item: Dict[str, Any]) -> str:
     lines = []
     lines.append(f"Trigger: {item.get('trigger', '')}")
     lines.append(f"Category: {item.get('category', '?')}")
+    # V2.2: surface stage, velocity, and regime if provided by caller
+    stage = item.get("stage")
+    if stage:
+        lines.append(f"Stage: {stage}")
+    velocity = item.get("velocity") or {}
+    if velocity:
+        accel = velocity.get("acceleration", "")
+        delta = velocity.get("recent_delta", 0.0)
+        if accel and accel != "INSUFFICIENT_DATA":
+            lines.append(f"Velocity: {accel} (Δ {delta*100:+.1f}pp)")
+    regime = item.get("regime") or {}
+    if regime and regime.get("regime") not in (None, "unknown"):
+        lines.append(f"Regime: {regime.get('regime')} (VIX {regime.get('vix', 0):.1f})")
     lines.append("")
     curr = item.get("last_probability") or 0
     prev = item.get("previous_probability")

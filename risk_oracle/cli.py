@@ -39,10 +39,20 @@ def cmd_refresh_watchlist(args: argparse.Namespace) -> int:
     from dataclasses import asdict
     from . import watchlist as wl
     from . import dispatch as dp
+    from . import lifecycle as lc
+    from . import velocity as vel
+    from . import regime as rg
     from .pipeline import run_forecast
     from .models import EvidenceFactor
 
     secrets = _load_secrets()
+
+    # V2.2: detect regime once per refresh batch (don't hammer FRED per item)
+    regime_info = rg.detect_regime(secrets)
+    regime_label = regime_info.get("regime", "unknown")
+    if args.verbose:
+        print(f"Regime: {regime_label} ({regime_info.get('note', '')})")
+
     items = wl.list_items()
     if not items:
         print("(watchlist is empty)")
@@ -69,18 +79,41 @@ def cmd_refresh_watchlist(args: argparse.Namespace) -> int:
                 secrets=secrets,
                 include_comparison=True,
             )
+
+            # V2.2: compute stage + velocity from the PRIOR history (before
+            # this refresh is appended), plus the new probability we just got.
+            prior_history = wl.history(item.id)
+            stage = lc.compute_stage(prior_history, current_probability=fr.point_p)
+            # For velocity, append a synthetic "this refresh" row to the history
+            synth = prior_history + [{
+                "probability": fr.point_p,
+                "band_low": fr.band_low,
+                "band_high": fr.band_high,
+            }]
+            v = vel.compute_velocity(synth)
+
             wl.record_refresh(
                 item_id=item.id,
                 probability=fr.point_p,
                 band_low=fr.band_low,
                 band_high=fr.band_high,
                 market_prob=fr.market_prob,
+                stage=stage,
+                velocity_acceleration=v.get("acceleration"),
+                velocity_recent_delta=v.get("recent_delta"),
+                regime_at_refresh=regime_label,
             )
+
             # Re-read to get the updated row (with previous_probability set)
             updated_items = wl.list_items()
             updated = next((u for u in updated_items if u.id == item.id), None)
             if updated is not None:
-                refreshed_dicts.append(asdict(updated))
+                row = asdict(updated)
+                # Pack the new context onto the dict so dispatch can read it
+                row["stage"] = stage
+                row["velocity"] = v
+                row["regime"] = regime_info
+                refreshed_dicts.append(row)
         except Exception as exc:
             failures.append({"id": item.id, "error": str(exc)})
 
@@ -89,7 +122,12 @@ def cmd_refresh_watchlist(args: argparse.Namespace) -> int:
         for f in failures:
             print(f"  ! item {f['id']}: {f['error']}")
 
-    # Dispatch on movement
+    # Dispatch on movement (regime-aware threshold)
+    # Apply regime-aware threshold override per item before dispatch.
+    for row in refreshed_dicts:
+        default_thr = float(row.get("alert_threshold", 0.05) or 0.05)
+        row["alert_threshold"] = rg.regime_alert_threshold(regime_label, default_thr)
+
     dispatched = dp.dispatch_movement_alerts(refreshed_dicts)
     sent = sum(1 for d in dispatched if d.get("email_sent") is True or d.get("telegram_sent") is True)
     skipped = sum(1 for d in dispatched if "skipped" in d)

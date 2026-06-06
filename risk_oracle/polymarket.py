@@ -137,12 +137,35 @@ def _fetch_markets_raw(limit: int = 50,
     return []
 
 
-def top_markets(limit: int = 20, sort_by: str = "volume") -> List[PolymarketMarket]:
-    """Return top live markets sorted by 24h volume or liquidity."""
+def top_markets(limit: int = 20, sort_by: str = "volume",
+                category_filter: Optional[str] = None,
+                exclude_categories: Optional[List[str]] = None) -> List[PolymarketMarket]:
+    """Return top live markets sorted by 24h volume or liquidity.
+
+    V2.2: supports category filtering.
+    - `category_filter`: keep only markets matching this category guess. One of
+      {"Politics", "Crypto", "Macro", "Stocks", "Sports", "Tech", "Other"}.
+      Pass None to get all categories.
+    - `exclude_categories`: drop markets whose guessed category is in this set.
+      Useful for "everything except Sports" views.
+
+    Both filters use `guess_category_label()` which inspects the question text,
+    tags, and description (not just the upstream `category` field, which is
+    often missing or generic).
+    """
     try:
-        raw = _fetch_markets_raw(limit=limit, sort_by=sort_by)
+        # When filtering, pull a larger pool so we have enough markets left over.
+        pool_limit = limit if (not category_filter and not exclude_categories) else max(200, limit * 10)
+        raw = _fetch_markets_raw(limit=pool_limit, sort_by=sort_by)
         out = [_parse_market(r) for r in raw]
-        return [m for m in out if m and m.question]
+        markets = [m for m in out if m and m.question]
+
+        if category_filter:
+            markets = [m for m in markets if guess_category_label(m) == category_filter]
+        if exclude_categories:
+            ex = set(exclude_categories)
+            markets = [m for m in markets if guess_category_label(m) not in ex]
+        return markets[:limit]
     except Exception:
         return []
 
@@ -193,6 +216,42 @@ CATEGORY_HINT_KEYWORDS = {
     "cyber_tech": ["hack", "breach", "ai", "agi"],
     "political_regulatory": ["election", "vote", "approval", "ban", "ruling"],
 }
+
+
+# V2.2: user-facing category labels for the Polymarket tab. These are the
+# categories real users care about when picking bets. Order matters — earlier
+# entries win when multiple match.
+USER_CATEGORY_KEYWORDS = {
+    "Stocks":  ["stock", "$nasdaq", "$spy", "$spx", "s&p 500", "nasdaq", "dow jones",
+                "tesla", "nvidia", "apple", "amazon", "msft", "googl", "meta",
+                "earnings", "ipo", "market cap", "share price", "ticker", "etf"],
+    "Crypto":  ["btc", "bitcoin", "ethereum", "eth", "solana", "sol ", "doge", "xrp",
+                "crypto", "altcoin", "memecoin", "stablecoin", "defi", "nft",
+                "binance", "coinbase", "tether"],
+    "Macro":   ["recession", "inflation", "fed ", "fomc", "rate cut", "rate hike",
+                "interest rate", "gdp", "unemployment", "cpi", "ppi", "yield",
+                "treasury", "powell", "ecb", "boj"],
+    "Politics":["election", "president", "trump", "biden", "harris", "vance",
+                "congress", "senate", "house", "vote", "polls", "approval rating",
+                "primary", "caucus", "supreme court", "ruling"],
+    "Sports":  ["nba", "nfl", "mlb", "nhl", "champion", "championship",
+                "world cup", "fifa", "uefa", "premier league", "la liga",
+                "wimbledon", "grand slam", "super bowl", "f1", "ufc",
+                "olympics", "world series", "playoff"],
+    "Tech":    ["ai ", "agi", " gpt", "openai", "anthropic", "claude",
+                "grok", "tesla self-driving", "autopilot", "cybertruck",
+                "spacex", "starship"],
+}
+
+
+def guess_category_label(market: PolymarketMarket) -> str:
+    """V2.2: classify a Polymarket market into a user-facing bucket.
+    Returns one of {Stocks, Crypto, Macro, Politics, Sports, Tech, Other}."""
+    text = (market.question + " " + market.description + " " + (market.category or "")).lower()
+    for label, keywords in USER_CATEGORY_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            return label
+    return "Other"
 
 
 def guess_category(market: PolymarketMarket) -> str:
